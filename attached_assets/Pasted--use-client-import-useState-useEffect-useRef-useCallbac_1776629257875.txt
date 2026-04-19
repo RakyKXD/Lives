@@ -1,0 +1,896 @@
+"use client"
+
+import { useState, useEffect, useRef, useCallback } from "react"
+import { Navbar } from "@/components/navbar"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import {
+  Radio,
+  Users,
+  Video,
+  VideoOff,
+  Mic,
+  MicOff,
+  MonitorUp,
+  X,
+  Copy,
+  Check,
+  Eye,
+  Maximize,
+  Minimize,
+  RefreshCw,
+  Send,
+  MessageCircle,
+} from "lucide-react"
+
+const WS_URL = "wss://hello-world--admin4522.replit.app/api/ws"
+
+const ICE_SERVERS: RTCConfiguration = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+  ],
+}
+
+interface RoomInfo {
+  roomId: string
+  viewers: number
+  title?: string
+  streamerName?: string
+}
+
+interface ChatMessage {
+  id: string
+  peerId: string
+  username: string
+  text: string
+  timestamp: number
+}
+
+// Mini componente para reproducir los videos de preview
+const MiniVideoPlayer = ({ stream }: { stream: MediaStream }) => {
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream
+      // ⚠️ TRUCO DEFINITIVO: Forzar el mute directamente en el DOM para móviles
+      videoRef.current.muted = true
+
+      videoRef.current.play().catch((err) => {
+        console.warn("Autoplay bloqueado en la vista previa:", err)
+      })
+    }
+  }, [stream])
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      muted // <-- Necesario para React, pero el DOM manda (arriba)
+      playsInline
+      className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+    />
+  )
+}
+
+export default function TVPage() {
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [isWatching, setIsWatching] = useState(false)
+  const [streamTitle, setStreamTitle] = useState("")
+  const [streamerName, setStreamerName] = useState("")
+  const [roomId, setRoomId] = useState("")
+  const [joinRoomId, setJoinRoomId] = useState("")
+  const [copied, setCopied] = useState(false)
+  const [isCameraOn, setIsCameraOn] = useState(true)
+  const [isMicOn, setIsMicOn] = useState(true)
+  const [isScreenShare, setIsScreenShare] = useState(false)
+  const [viewerCount, setViewerCount] = useState(0)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [liveRooms, setLiveRooms] = useState<RoomInfo[]>([])
+  const [isConnecting, setIsConnecting] = useState(false)
+  const [connectionStatus, setConnectionStatus] = useState<string>("")
+  const [hasRemoteStream, setHasRemoteStream] = useState(false)
+
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
+  const [previewStreams, setPreviewStreams] = useState<Record<string, MediaStream>>({})
+
+  // Chat state
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatInput, setChatInput] = useState("")
+  const [username, setUsername] = useState("")
+  const [showChat, setShowChat] = useState(true)
+  const chatEndRef = useRef<HTMLDivElement>(null)
+  const connectedPeersRef = useRef<Set<string>>(new Set())
+
+  const localVideoRef = useRef<HTMLVideoElement>(null)
+  const remoteVideoRef = useRef<HTMLVideoElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const localStreamRef = useRef<MediaStream | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const peerIdRef = useRef<string>("")
+  const currentRoomRef = useRef<string>("")
+
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const viewerPcRef = useRef<RTCPeerConnection | null>(null)
+
+  const previewPcsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const requestedPreviewsRef = useRef<Set<string>>(new Set())
+
+  const generatePeerId = () => "peer_" + Math.random().toString(36).slice(2, 10)
+  const generateRoomId = () => Math.random().toString(36).slice(2, 8).toUpperCase()
+  const getUsername = () => username.trim() || `Usuario${Math.floor(Math.random() * 9999)}`
+
+  // 1. Efecto para asegurar que el Broadcaster vea su propio video
+  useEffect(() => {
+    if (isStreaming && localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current
+    }
+  }, [isStreaming])
+
+  // 2. Efecto para asegurar que el Viewer reciba el video (con manejo de promesas seguro)
+  useEffect(() => {
+    const videoEl = remoteVideoRef.current
+
+    if (isWatching && videoEl && remoteStream) {
+      // Solo asignamos si el stream es realmente diferente
+      if (videoEl.srcObject !== remoteStream) {
+        videoEl.srcObject = remoteStream
+      }
+
+      const attemptPlay = async () => {
+        try {
+          // Intentamos reproducir con audio primero
+          await videoEl.play()
+        } catch (err: any) {
+          // Si el error es AbortError, lo ignoramos, significa que un nuevo stream pisó a este
+          if (err.name === 'AbortError') return
+
+          console.warn("El navegador bloqueó el Autoplay por tener audio. Forzando mute...")
+
+          // Plan B: Si bloquea el audio, lo silenciamos y lo reproducimos igual
+          videoEl.muted = true
+          try {
+            await videoEl.play()
+          } catch (fallbackErr: any) {
+            if (fallbackErr.name !== 'AbortError') {
+              console.error("Fallo total de reproducción:", fallbackErr)
+            }
+          }
+        }
+      }
+
+      attemptPlay()
+    }
+  }, [isWatching, remoteStream])
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [chatMessages])
+
+  const sendMessage = useCallback((message: object) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(message))
+    }
+  }, [])
+
+  const cleanupPreviews = useCallback(() => {
+    previewPcsRef.current.forEach(pc => pc.close())
+    previewPcsRef.current.clear()
+    requestedPreviewsRef.current.clear()
+    setPreviewStreams({})
+  }, [])
+
+  useEffect(() => {
+    if (isStreaming || isWatching || liveRooms.length === 0) return
+
+    liveRooms.forEach(room => {
+      if (!previewStreams[room.roomId] && !requestedPreviewsRef.current.has(room.roomId)) {
+        requestedPreviewsRef.current.add(room.roomId)
+        const previewPeerId = "prev_" + Math.random().toString(36).slice(2, 8)
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          sendMessage({
+            type: "join",
+            roomId: room.roomId,
+            peerId: previewPeerId,
+            role: "viewer"
+          })
+        }
+      }
+    })
+  }, [liveRooms, isStreaming, isWatching, previewStreams, sendMessage])
+
+  const createBroadcasterConnection = useCallback((viewerId: string) => {
+    const pc = new RTCPeerConnection(ICE_SERVERS)
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localStreamRef.current!)
+      })
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendMessage({
+          type: "ice-candidate",
+          roomId: currentRoomRef.current,
+          targetPeerId: viewerId,
+          candidate: event.candidate,
+        })
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") {
+        connectedPeersRef.current.add(viewerId)
+      }
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed" || pc.connectionState === "closed") {
+        pc.close()
+        peerConnectionsRef.current.delete(viewerId)
+        connectedPeersRef.current.delete(viewerId)
+        setChatMessages(prev => prev.filter(msg => msg.peerId !== viewerId))
+      }
+    }
+
+    peerConnectionsRef.current.set(viewerId, pc)
+    return pc
+  }, [sendMessage])
+
+  const setupMessageHandlers = useCallback((ws: WebSocket, isBroadcaster: boolean) => {
+    ws.onmessage = async (event) => {
+      const data = JSON.parse(event.data)
+
+      switch (data.type) {
+        case "joined":
+          if (data.roomId === currentRoomRef.current) {
+            setConnectionStatus(isBroadcaster ? "Transmitiendo" : "En sala, esperando stream...")
+            if (data.viewers !== undefined) setViewerCount(data.viewers)
+          }
+          break
+
+        case "viewer-joined": {
+          if (!isBroadcaster) break
+          connectedPeersRef.current.add(data.peerId)
+
+          const pc = createBroadcasterConnection(data.peerId)
+          try {
+            const offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            sendMessage({
+              type: "offer",
+              roomId: currentRoomRef.current,
+              targetPeerId: data.peerId,
+              sdp: pc.localDescription,
+            })
+          } catch (err) {
+            console.error("Error creating offer:", err)
+          }
+          break
+        }
+
+        case "offer": {
+          if (isBroadcaster) break
+
+          const isPreview = !isWatching && data.roomId !== currentRoomRef.current
+          const pc = new RTCPeerConnection(ICE_SERVERS)
+
+          if (isPreview) {
+            previewPcsRef.current.set(data.roomId, pc)
+          } else {
+            viewerPcRef.current = pc
+          }
+
+          pc.ontrack = (event) => {
+            const stream = event.streams[0] || new MediaStream([event.track])
+            if (isPreview) {
+              setPreviewStreams(prev => ({ ...prev, [data.roomId]: stream }))
+            } else {
+              setRemoteStream(stream)
+              setHasRemoteStream(true)
+              setConnectionStatus("Conectado")
+
+              // Aquí ya no asignamos el srcObject directamente para evitar el AbortError.
+              // El useEffect de React (arriba) se encarga de esto limpiamente.
+            }
+          }
+
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              sendMessage({
+                type: "ice-candidate",
+                roomId: data.roomId,
+                targetPeerId: data.fromPeerId || "broadcaster",
+                candidate: event.candidate,
+              })
+            }
+          }
+
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
+            const answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            sendMessage({
+              type: "answer",
+              roomId: data.roomId,
+              targetPeerId: data.fromPeerId || "broadcaster",
+              sdp: pc.localDescription,
+            })
+          } catch (err) {
+            console.error("Error handling offer:", err)
+            if (!isPreview) setError("Error al conectar con la transmision")
+          }
+          break
+        }
+
+        case "answer": {
+          if (!isBroadcaster) break
+          const pc = peerConnectionsRef.current.get(data.fromPeerId)
+          if (pc) {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
+            } catch (err) {
+              console.error("Error setting answer:", err)
+            }
+          }
+          break
+        }
+
+        case "ice-candidate": {
+          if (isBroadcaster) {
+            const pc = peerConnectionsRef.current.get(data.fromPeerId)
+            if (pc && data.candidate) {
+              pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.error)
+            }
+          } else {
+            const isPreview = !isWatching && data.roomId !== currentRoomRef.current
+            const pc = isPreview ? previewPcsRef.current.get(data.roomId) : viewerPcRef.current
+
+            if (pc && data.candidate) {
+              pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.error)
+            }
+          }
+          break
+        }
+
+        case "viewer-count":
+          if (data.roomId === currentRoomRef.current) setViewerCount(data.count)
+          break
+
+        case "peer-left":
+          if (data.roomId === currentRoomRef.current) {
+            connectedPeersRef.current.delete(data.peerId)
+            setChatMessages(prev => prev.filter(msg => msg.peerId !== data.peerId))
+            if (isBroadcaster) {
+              const pc = peerConnectionsRef.current.get(data.peerId)
+              if (pc) {
+                pc.close()
+                peerConnectionsRef.current.delete(data.peerId)
+              }
+            }
+          }
+          break
+
+        case "stream-ended":
+          if (data.roomId === currentRoomRef.current) {
+            setError("La transmision ha terminado")
+            leaveStream()
+          } else if (!isWatching) {
+            setPreviewStreams(prev => {
+              const newStreams = { ...prev }
+              delete newStreams[data.roomId]
+              return newStreams
+            })
+            const pc = previewPcsRef.current.get(data.roomId)
+            if (pc) {
+              pc.close()
+              previewPcsRef.current.delete(data.roomId)
+            }
+          }
+          break
+
+        case "rooms":
+          setLiveRooms(data.rooms || [])
+          break
+
+        case "chat":
+          if (data.roomId === currentRoomRef.current && data.message.peerId !== peerIdRef.current) {
+            connectedPeersRef.current.add(data.message.peerId)
+            setChatMessages(prev => prev.some(m => m.id === data.message.id) ? prev : [...prev, data.message])
+          }
+          break
+
+        case "error":
+          setError(data.message || "Error del servidor")
+          break
+      }
+    }
+  }, [createBroadcasterConnection, isWatching, sendMessage])
+
+  const connectWebSocket = useCallback((): Promise<WebSocket> => {
+    return new Promise((resolve, reject) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        resolve(wsRef.current)
+        return
+      }
+
+      if (wsRef.current) wsRef.current.close()
+
+      const ws = new WebSocket(WS_URL)
+      wsRef.current = ws
+
+      const timeout = setTimeout(() => reject(new Error("Connection timeout")), 10000)
+
+      ws.onopen = () => {
+        clearTimeout(timeout)
+        setConnectionStatus("Conectado al servidor")
+        if (!isStreaming && !isWatching) {
+          setupMessageHandlers(ws, false)
+        }
+        resolve(ws)
+      }
+
+      ws.onerror = (err) => {
+        clearTimeout(timeout)
+        setError("⚠️Error de conexion con el servidor")
+        reject(err)
+      }
+
+      ws.onclose = () => {
+        setConnectionStatus("Desconectado")
+        wsRef.current = null
+      }
+    })
+  }, [isStreaming, isWatching, setupMessageHandlers])
+
+  const startStream = async (screenShare = false) => {
+    try {
+      cleanupPreviews()
+      setError(null)
+      setIsConnecting(true)
+      setConnectionStatus("Obteniendo media...")
+      setChatMessages([])
+      connectedPeersRef.current.clear()
+
+      let stream: MediaStream
+      if (screenShare) {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+        stream.getVideoTracks()[0].onended = () => stopStream()
+        setIsScreenShare(true)
+      } else {
+        stream = await navigator.mediaDevices.getUserMedia({ video: isCameraOn, audio: isMicOn })
+      }
+
+      localStreamRef.current = stream
+
+      setConnectionStatus("Conectando al servidor...")
+      const ws = await connectWebSocket()
+
+      peerIdRef.current = generatePeerId()
+      const newRoomId = generateRoomId()
+      setRoomId(newRoomId)
+      currentRoomRef.current = newRoomId
+
+      setupMessageHandlers(ws, true)
+
+      sendMessage({
+        type: "join",
+        roomId: newRoomId,
+        peerId: peerIdRef.current,
+        role: "broadcaster",
+        title: streamTitle || undefined,
+        name: streamerName || undefined,
+      })
+
+      setIsStreaming(true)
+      setIsConnecting(false)
+    } catch (err) {
+      console.error(err)
+      setError("No se pudo iniciar la transmision. Asegurate de dar permisos de camara/microfono.")
+      setIsConnecting(false)
+    }
+  }
+
+  const stopStream = () => {
+    sendMessage({ type: "leave", roomId: currentRoomRef.current })
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop())
+      localStreamRef.current = null
+    }
+
+    peerConnectionsRef.current.forEach((pc) => pc.close())
+    peerConnectionsRef.current.clear()
+
+    setIsStreaming(false)
+    setIsScreenShare(false)
+    setRoomId("")
+    currentRoomRef.current = ""
+    setViewerCount(0)
+    setConnectionStatus("")
+    setChatMessages([])
+    connectedPeersRef.current.clear()
+
+    fetchLiveRooms()
+  }
+
+  const joinStream = async (id?: string) => {
+    const targetRoomId = (id || joinRoomId).toUpperCase().trim()
+    if (!targetRoomId) {
+      setError("Introduce un ID de transmision valido")
+      return
+    }
+
+    try {
+      cleanupPreviews()
+      setError(null)
+      setIsConnecting(true)
+      setHasRemoteStream(false)
+      setConnectionStatus("Conectando...")
+      setRoomId(targetRoomId)
+      currentRoomRef.current = targetRoomId
+      setChatMessages([])
+      connectedPeersRef.current.clear()
+      setRemoteStream(null)
+
+      const ws = await connectWebSocket()
+      peerIdRef.current = generatePeerId()
+
+      setupMessageHandlers(ws, false)
+
+      sendMessage({
+        type: "join",
+        roomId: targetRoomId,
+        peerId: peerIdRef.current,
+        role: "viewer",
+      })
+
+      setIsWatching(true)
+      setIsConnecting(false)
+    } catch (err) {
+      console.error(err)
+      setError("No se pudo conectar a la transmision")
+      setIsConnecting(false)
+    }
+  }
+
+  const leaveStream = useCallback(() => {
+    sendMessage({ type: "leave", roomId: currentRoomRef.current })
+
+    if (viewerPcRef.current) {
+      viewerPcRef.current.close()
+      viewerPcRef.current = null
+    }
+
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null
+
+    setIsWatching(false)
+    setRoomId("")
+    currentRoomRef.current = ""
+    setConnectionStatus("")
+    setHasRemoteStream(false)
+    setChatMessages([])
+    setRemoteStream(null)
+    connectedPeersRef.current.clear()
+
+    fetchLiveRooms()
+  }, [sendMessage])
+
+  const toggleCamera = () => {
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled
+        setIsCameraOn(videoTrack.enabled)
+      }
+    }
+  }
+
+  const toggleMic = () => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0]
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled
+        setIsMicOn(audioTrack.enabled)
+      }
+    }
+  }
+
+  const copyRoomId = () => {
+    navigator.clipboard.writeText(roomId)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const toggleFullscreen = () => {
+    if (!containerRef.current) return
+    if (!document.fullscreenElement) {
+      containerRef.current.requestFullscreen()
+      setIsFullscreen(true)
+    } else {
+      document.exitFullscreen()
+      setIsFullscreen(false)
+    }
+  }
+
+  const fetchLiveRooms = useCallback(async () => {
+    try {
+      const ws = await connectWebSocket()
+      sendMessage({ type: "list-rooms" })
+    } catch {
+      // Ignore
+    }
+  }, [connectWebSocket, sendMessage])
+
+  useEffect(() => {
+    fetchLiveRooms()
+    const interval = setInterval(fetchLiveRooms, 10000)
+    return () => clearInterval(interval)
+  }, [fetchLiveRooms])
+
+  useEffect(() => {
+    return () => {
+      if (localStreamRef.current) localStreamRef.current.getTracks().forEach((track) => track.stop())
+      peerConnectionsRef.current.forEach((pc) => pc.close())
+      previewPcsRef.current.forEach((pc) => pc.close())
+      if (viewerPcRef.current) viewerPcRef.current.close()
+      if (wsRef.current) wsRef.current.close()
+    }
+  }, [])
+
+  const sendChatMessage = () => {
+    if (!chatInput.trim()) return
+    const message: ChatMessage = {
+      id: Math.random().toString(36).slice(2),
+      peerId: peerIdRef.current,
+      username: getUsername(),
+      text: chatInput.trim(),
+      timestamp: Date.now(),
+    }
+    setChatMessages(prev => [...prev, message])
+    sendMessage({ type: "chat", roomId: currentRoomRef.current, message })
+    setChatInput("")
+  }
+
+  const chatPanelNode = (
+    <div className={`flex flex-col ${isFullscreen ? "absolute right-4 top-4 bottom-4 w-80 z-50" : "mt-4 h-80"} rounded-xl border border-border bg-card overflow-hidden`}>
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <MessageCircle className="h-4 w-4" />
+          Chat en Vivo
+        </div>
+        <button onClick={() => setShowChat(!showChat)} className="text-muted-foreground hover:text-foreground">
+          {showChat ? <X className="h-4 w-4" /> : <MessageCircle className="h-4 w-4" />}
+        </button>
+      </div>
+
+      {showChat && (
+        <>
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            {chatMessages.length === 0 ? (
+              <p className="text-center text-xs text-muted-foreground py-4">No hay mensajes aun.</p>
+            ) : (
+              chatMessages.map((msg) => (
+                <div key={msg.id} className="text-sm">
+                  <span className="font-medium text-primary">{msg.username}: </span>
+                  <span className="text-foreground">{msg.text}</span>
+                </div>
+              ))
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          <div className="border-t border-border p-3">
+            <Input
+              placeholder="Tu nombre (opcional)"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="mb-2 h-8 text-sm bg-secondary font-medium text-primary"
+            />
+            <div className="flex gap-2">
+              <Input
+                placeholder="Escribe un mensaje..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
+                className="flex-1 h-9 text-sm bg-secondary"
+              />
+              <Button size="sm" onClick={sendChatMessage} className="h-9 w-9 p-0">
+                <Send className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+
+  return (
+    <main className="min-h-screen bg-background">
+      <Navbar activeCategory="tv" />
+      <div className="pt-20 md:pt-16">
+        <div className="mx-auto max-w-screen-xl px-4 py-8 md:px-8">
+          <div className="mb-8 flex items-center gap-3">
+            <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-red-500/20">
+              <Radio className="h-6 w-6 text-red-500" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-foreground md:text-3xl">TV en Directo</h1>
+              <p className="text-sm text-muted-foreground">Transmite en directo o mira streams de otros usuarios</p>
+            </div>
+          </div>
+
+          {error && <div className="mb-6 rounded-lg bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>}
+
+          {!isStreaming && !isWatching ? (
+            <div className="grid gap-8 lg:grid-cols-2">
+              <div className="space-y-8">
+                <div className="rounded-2xl border border-border bg-card p-6">
+                  <h2 className="mb-4 text-lg font-semibold text-foreground">Iniciar Transmision</h2>
+                  <div className="mb-4 space-y-3">
+                    <Input placeholder="Titulo" value={streamTitle} onChange={(e) => setStreamTitle(e.target.value)} className="bg-secondary" />
+                    <Input placeholder="Tu nombre" value={streamerName} onChange={(e) => setStreamerName(e.target.value)} className="bg-secondary" />
+                  </div>
+                  <div className="flex flex-col gap-3 sm:flex-row">
+                    <Button onClick={() => startStream(false)} disabled={isConnecting} className="flex-1 gap-2 bg-red-500 text-white hover:bg-red-600">
+                      {isConnecting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Video className="h-4 w-4" />} Camara
+                    </Button>
+                    <Button onClick={() => startStream(true)} disabled={isConnecting} variant="outline" className="flex-1 gap-2">
+                      <MonitorUp className="h-4 w-4" /> Pantalla
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-border bg-card p-6">
+                  <h2 className="mb-4 text-lg font-semibold text-foreground">Ver Transmision</h2>
+                  <div className="flex gap-3">
+                    <Input placeholder="ID (ej: ABC123)" value={joinRoomId} onChange={(e) => setJoinRoomId(e.target.value.toUpperCase())} className="flex-1 bg-secondary font-mono uppercase" maxLength={8} />
+                    <Button onClick={() => joinStream()} disabled={isConnecting} className="gap-2">
+                      {isConnecting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />} Ver
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="lg:col-span-1">
+                <div className="mb-4 flex items-center justify-between">
+                  <h2 className="text-lg font-semibold text-foreground">Directos Activos</h2>
+                  <Button variant="ghost" size="sm" onClick={fetchLiveRooms} className="gap-2 text-muted-foreground">
+                    <RefreshCw className="h-4 w-4" /> Refrescar
+                  </Button>
+                </div>
+
+                {liveRooms.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-border bg-card/50 p-12 text-center">
+                    <Radio className="mx-auto mb-4 h-12 w-12 text-muted-foreground/50" />
+                    <p className="text-muted-foreground">No hay transmisiones en directo</p>
+                  </div>
+                ) : (
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    {liveRooms.map((room) => (
+                      <button
+                        key={room.roomId}
+                        onClick={() => joinStream(room.roomId)}
+                        className="group relative overflow-hidden rounded-xl border border-border bg-card p-0 text-left transition-all hover:border-red-500/50 hover:bg-card/80 flex flex-col"
+                      >
+                        <div className="relative flex aspect-video w-full items-center justify-center bg-black overflow-hidden">
+                          {previewStreams[room.roomId] ? (
+                            <MiniVideoPlayer stream={previewStreams[room.roomId]} />
+                          ) : (
+                            <Radio className="h-8 w-8 text-red-500 animate-pulse" />
+                          )}
+
+                          <div className="absolute top-2 left-2 flex items-center gap-1 rounded-full bg-red-500 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm">
+                            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" /> EN VIVO
+                          </div>
+                          <div className="absolute bottom-2 right-2 flex items-center gap-1 rounded-md bg-black/70 px-2 py-1 text-xs text-white backdrop-blur-sm">
+                            <Users className="h-3 w-3" /> {room.viewers}
+                          </div>
+                        </div>
+
+                        <div className="flex w-full flex-col items-start p-4">
+                          <h3 className="font-semibold text-foreground line-clamp-1 w-full" title={room.title || room.roomId}>
+                            {room.title || `Sala ${room.roomId}`}
+                          </h3>
+                          <p className="mt-1 text-sm text-muted-foreground line-clamp-1 w-full">
+                            👤 {room.streamerName || "Anónimo"}
+                          </p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : isStreaming ? (
+            <div className="grid gap-4 lg:grid-cols-[1fr_320px]">
+              <div ref={containerRef} className="relative">
+                <div className="overflow-hidden rounded-2xl bg-black">
+                  <video ref={localVideoRef} autoPlay muted playsInline className="aspect-video w-full object-contain" />
+                  <div className="absolute top-4 left-4 flex items-center gap-2">
+                    <div className="flex items-center gap-1 rounded-full bg-red-500 px-3 py-1 text-xs font-bold text-white">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-white" /> EN VIVO
+                    </div>
+                    <div className="flex items-center gap-1 rounded-full bg-black/50 px-3 py-1 text-xs text-white backdrop-blur-sm">
+                      <Users className="h-3 w-3" /> {viewerCount}
+                    </div>
+                    {connectionStatus && <div className="rounded-full bg-black/50 px-3 py-1 text-xs text-white/70 backdrop-blur-sm">{connectionStatus}</div>}
+                  </div>
+                  <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        {!isScreenShare && (
+                          <>
+                            <Button size="sm" variant={isCameraOn ? "secondary" : "destructive"} onClick={toggleCamera} className="h-9 w-9 p-0">
+                              {isCameraOn ? <Video className="h-4 w-4" /> : <VideoOff className="h-4 w-4" />}
+                            </Button>
+                            <Button size="sm" variant={isMicOn ? "secondary" : "destructive"} onClick={toggleMic} className="h-9 w-9 p-0">
+                              {isMicOn ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4" />}
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button size="sm" variant="secondary" onClick={toggleFullscreen} className="h-9 w-9 p-0">
+                          {isFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+                        </Button>
+                        <Button size="sm" variant="destructive" onClick={stopStream} className="gap-2">
+                          <X className="h-4 w-4" /> Detener
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-4 rounded-xl border border-border bg-card p-4">
+                  <p className="mb-2 text-sm text-muted-foreground">Comparte este ID:</p>
+                  <div className="flex gap-2">
+                    <Input value={roomId} readOnly className="flex-1 bg-secondary font-mono text-lg font-bold tracking-widest" />
+                    <Button onClick={copyRoomId} variant="secondary" className="gap-2">
+                      {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />} Copiar
+                    </Button>
+                  </div>
+                </div>
+              </div>
+              {chatPanelNode}
+            </div>
+          ) : (
+            <div className="grid gap-4 lg:grid-cols-[1fr_320px]">
+              <div ref={containerRef} className="relative">
+                <div className="overflow-hidden rounded-2xl bg-black">
+                  <video ref={remoteVideoRef} autoPlay playsInline controls className="aspect-video w-full object-contain" />
+
+                  {!hasRemoteStream && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-zinc-900">
+                      <div className="text-center">
+                        <Radio className="mx-auto mb-4 h-16 w-16 text-red-500 animate-pulse" />
+                        <p className="text-lg font-medium text-white">Conectando...</p>
+                        <p className="mt-1 text-sm text-white/60">ID: {roomId}</p>
+                      </div>
+                    </div>
+                  )}
+                  <div className="absolute top-4 left-4 flex items-center gap-2 pointer-events-none">
+                    <div className="flex items-center gap-1 rounded-full bg-red-500 px-3 py-1 text-xs font-bold text-white shadow-md">
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-white" /> EN VIVO
+                    </div>
+                    <div className="rounded-full bg-black/50 px-3 py-1 text-xs text-white backdrop-blur-sm font-mono shadow-md">{roomId}</div>
+                  </div>
+                  <div className="absolute top-4 right-4 flex items-center justify-end gap-2">
+                    <Button size="sm" variant="secondary" onClick={toggleFullscreen} className="h-9 w-9 p-0 opacity-80 hover:opacity-100">
+                      {isFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+                    </Button>
+                    <Button size="sm" variant="destructive" onClick={leaveStream} className="gap-2 opacity-80 hover:opacity-100">
+                      <X className="h-4 w-4" /> Salir
+                    </Button>
+                  </div>
+                </div>
+              </div>
+              {chatPanelNode}
+            </div>
+          )}
+        </div>
+      </div>
+    </main>
+  )
+}
