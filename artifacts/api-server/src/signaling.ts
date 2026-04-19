@@ -13,6 +13,21 @@ interface Peer {
 const rooms = new Map<string, { broadcasterId: string; viewerIds: Set<string> }>();
 const peers = new Map<string, Peer>();
 
+/** Resolve the target peer ID from a message.
+ *  Accepts both `to` (our protocol) and `targetPeerId` (client compat).
+ *  The special value "broadcaster" resolves to the broadcaster of the room. */
+function resolveTarget(
+  msg: Record<string, unknown>,
+  roomId: string | null
+): string | null {
+  const raw = (msg["to"] ?? msg["targetPeerId"]) as string | undefined;
+  if (!raw) return null;
+  if (raw === "broadcaster" && roomId) {
+    return rooms.get(roomId)?.broadcasterId ?? null;
+  }
+  return raw;
+}
+
 export function setupSignaling(server: Server) {
   const wss = new WebSocketServer({ server, path: "/api/ws" });
 
@@ -24,55 +39,91 @@ export function setupSignaling(server: Server) {
     ws.on("message", (data: Buffer) => {
       try {
         const msg = JSON.parse(data.toString()) as Record<string, unknown>;
+        // roomId can come from the message itself (client compat)
+        const msgRoomId = (msg["roomId"] as string | undefined) ?? myRoomId;
 
-        // ── JOIN ──────────────────────────────────────────────────────────────
+        // ── JOIN ────────────────────────────────────────────────────────────
         if (msg["type"] === "join") {
           myPeerId = msg["peerId"] as string;
-          myRoomId = msg["roomId"] as string;
+          myRoomId = (msg["roomId"] as string) ?? myRoomId;
           myRole = msg["role"] as "broadcaster" | "viewer";
 
-          peers.set(myPeerId, { ws, roomId: myRoomId, peerId: myPeerId, role: myRole });
+          peers.set(myPeerId, { ws, roomId: myRoomId!, peerId: myPeerId, role: myRole });
 
           if (myRole === "broadcaster") {
-            if (rooms.has(myRoomId)) {
-              // Room already has a broadcaster
+            if (rooms.has(myRoomId!)) {
               ws.send(JSON.stringify({ type: "error", message: "Room already has a broadcaster" }));
               return;
             }
-            rooms.set(myRoomId, { broadcasterId: myPeerId, viewerIds: new Set() });
+            rooms.set(myRoomId!, { broadcasterId: myPeerId, viewerIds: new Set() });
             ws.send(JSON.stringify({ type: "joined", role: "broadcaster", viewers: 0 }));
             logger.info({ peerId: myPeerId, roomId: myRoomId }, "Broadcaster joined");
 
           } else {
-            // Viewer joining
-            const room = rooms.get(myRoomId);
+            // Viewer
+            const room = rooms.get(myRoomId!);
             if (!room) {
               ws.send(JSON.stringify({ type: "error", message: "Room not found or no broadcaster yet" }));
               return;
             }
-
             room.viewerIds.add(myPeerId);
-            ws.send(JSON.stringify({ type: "joined", role: "viewer", broadcasterId: room.broadcasterId }));
+            ws.send(JSON.stringify({
+              type: "joined",
+              role: "viewer",
+              broadcasterId: room.broadcasterId,
+              // compat: some clients use these fields
+              peerId: room.broadcasterId,
+            }));
 
-            // Notify broadcaster about new viewer
             const broadcaster = peers.get(room.broadcasterId);
             if (broadcaster && broadcaster.ws.readyState === WebSocket.OPEN) {
-              broadcaster.ws.send(JSON.stringify({ type: "viewer-joined", viewerId: myPeerId }));
+              broadcaster.ws.send(JSON.stringify({ type: "viewer-joined", peerId: myPeerId, viewerId: myPeerId }));
             }
 
-            // Broadcast updated viewer count to all
-            broadcastViewerCount(myRoomId);
+            broadcastViewerCount(myRoomId!);
             logger.info({ peerId: myPeerId, roomId: myRoomId, viewers: room.viewerIds.size }, "Viewer joined");
           }
 
-        // ── SIGNALING (offer / answer / ice-candidate) ────────────────────────
-        } else if (msg["type"] === "offer" || msg["type"] === "answer" || msg["type"] === "ice-candidate") {
-          const target = peers.get(msg["to"] as string);
+        // ── SIGNALING ───────────────────────────────────────────────────────
+        } else if (
+          msg["type"] === "offer" ||
+          msg["type"] === "answer" ||
+          msg["type"] === "ice-candidate"
+        ) {
+          const targetId = resolveTarget(msg, msgRoomId ?? null);
+          if (!targetId) return;
+
+          const target = peers.get(targetId);
           if (target && target.ws.readyState === WebSocket.OPEN) {
-            target.ws.send(JSON.stringify({ ...msg, from: myPeerId }));
+            // Forward with both `from` and `fromPeerId` for compatibility
+            target.ws.send(JSON.stringify({
+              ...msg,
+              from: myPeerId,
+              fromPeerId: myPeerId,
+            }));
           }
 
-        // ── LIST ROOMS ────────────────────────────────────────────────────────
+        // ── CHAT ────────────────────────────────────────────────────────────
+        } else if (msg["type"] === "chat") {
+          const room = rooms.get(msgRoomId ?? "");
+          if (!room) return;
+
+          const chatPayload = JSON.stringify({ ...msg, fromPeerId: myPeerId });
+
+          // Forward to broadcaster
+          const broadcaster = peers.get(room.broadcasterId);
+          if (broadcaster && broadcaster.ws.readyState === WebSocket.OPEN && broadcaster.peerId !== myPeerId) {
+            broadcaster.ws.send(chatPayload);
+          }
+
+          // Forward to all viewers except sender
+          room.viewerIds.forEach((vid) => {
+            if (vid === myPeerId) return;
+            const v = peers.get(vid);
+            if (v && v.ws.readyState === WebSocket.OPEN) v.ws.send(chatPayload);
+          });
+
+        // ── LIST ROOMS ──────────────────────────────────────────────────────
         } else if (msg["type"] === "list-rooms") {
           const list = [...rooms.entries()].map(([roomId, room]) => ({
             roomId,
@@ -80,7 +131,7 @@ export function setupSignaling(server: Server) {
           }));
           ws.send(JSON.stringify({ type: "rooms", rooms: list }));
 
-        // ── LEAVE ─────────────────────────────────────────────────────────────
+        // ── LEAVE ───────────────────────────────────────────────────────────
         } else if (msg["type"] === "leave") {
           cleanup();
         }
@@ -121,7 +172,6 @@ export function setupSignaling(server: Server) {
       }
 
       if (myRole === "broadcaster") {
-        // Notify all viewers the stream ended
         room.viewerIds.forEach((vid) => {
           const v = peers.get(vid);
           if (v && v.ws.readyState === WebSocket.OPEN) {
@@ -132,10 +182,10 @@ export function setupSignaling(server: Server) {
         logger.info({ peerId: myPeerId, roomId: myRoomId }, "Broadcaster left — room closed");
       } else {
         room.viewerIds.delete(myPeerId);
-        // Notify broadcaster a viewer left
         const broadcaster = peers.get(room.broadcasterId);
         if (broadcaster && broadcaster.ws.readyState === WebSocket.OPEN) {
-          broadcaster.ws.send(JSON.stringify({ type: "viewer-left", viewerId: myPeerId }));
+          broadcaster.ws.send(JSON.stringify({ type: "viewer-left", peerId: myPeerId, viewerId: myPeerId }));
+          broadcaster.ws.send(JSON.stringify({ type: "peer-left", peerId: myPeerId }));
         }
         broadcastViewerCount(myRoomId);
         logger.info({ peerId: myPeerId, roomId: myRoomId, viewers: room.viewerIds.size }, "Viewer left");
